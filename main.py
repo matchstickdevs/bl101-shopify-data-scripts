@@ -18,17 +18,19 @@ Architecture:
   on each order object in the JSONL and are extracted during parsing.
 
 Usage:
-    Deployed as Cloud Run function, triggered daily via Cloud Scheduler.
+    Deployed as a Cloud Run Job, triggered daily via Cloud Scheduler.
+    Run with no arguments for the daily sync (2-day rolling window).
+    Run with --start/--end or --year for backfills.
 
 GCP Secrets Required:
     - shopify_client_id: Shopify app client ID
     - shopify_client_secret: Shopify app client secret
 """
 
-import functions_framework
 import requests
 import json
 import logging
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import secretmanager
 from google.cloud import bigquery
@@ -1460,73 +1462,58 @@ def sync_orders_for_date_range(token, client, start_date, end_date, staging_suff
 
 
 # ============================================
-# CLOUD RUN ENTRY POINT
+# CLOUD RUN JOB ENTRY POINT
 # ============================================
 
-@functions_framework.http
-def main(request):
+def run_daily_sync():
     """
-    Cloud Run HTTP entry point.
-    Syncs orders updated yesterday to BigQuery using Shopify Bulk Operations.
+    Daily sync entry point. Syncs the last 2 days of orders to BigQuery.
+    The 2-day window catches orders whose customerJourneySummary attribution
+    data populates after creation.
     """
-    try:
-        start_time = time.time()
+    start_time = time.time()
 
-        logger.info("=" * 60)
-        logger.info("SHOPIFY DAILY ORDER SYNC (BULK OPERATIONS)")
-        logger.info("=" * 60)
+    logger.info("=" * 60)
+    logger.info("SHOPIFY DAILY ORDER SYNC (BULK OPERATIONS)")
+    logger.info("=" * 60)
 
-        # Calculate date range (UTC) — 2-day window to catch orders whose
-        # customerJourneySummary attribution data populates after creation
-        today = datetime.now(timezone.utc).date()
-        two_days_ago = today - timedelta(days=2)
-        start_date = two_days_ago.isoformat()
-        end_date = today.isoformat()
+    today = datetime.now(timezone.utc).date()
+    two_days_ago = today - timedelta(days=2)
+    start_date = two_days_ago.isoformat()
+    end_date = today.isoformat()
 
-        logger.info(f"Syncing orders updated: {start_date} to {end_date}")
+    logger.info(f"Syncing orders updated: {start_date} to {end_date}")
 
-        token = get_shopify_token()
-        client = get_bq_client()
+    token = get_shopify_token()
+    client = get_bq_client()
 
-        success, error, total_stats = sync_orders_for_date_range(
-            token, client, start_date, end_date
-        )
+    success, error, total_stats = sync_orders_for_date_range(
+        token, client, start_date, end_date
+    )
 
-        total_time = time.time() - start_time
+    total_time = time.time() - start_time
 
-        if not success:
-            logger.error(f"Sync failed: {error}")
-            return f"Sync failed: {error}", 500
+    if not success:
+        logger.error(f"Sync failed: {error}")
+        sys.exit(1)
 
-        if total_stats[TABLE_ORDERS]["total"] == 0:
-            logger.info("No orders found for the date range.")
-            return f"Daily Sync Complete!\n\nDate range: {start_date} to {end_date}\nNo orders found.\nTotal time: {total_time:.2f}s", 200
+    if total_stats[TABLE_ORDERS]["total"] == 0:
+        logger.info(f"Daily Sync Complete! No orders found for {start_date} to {end_date}. Total time: {total_time:.2f}s")
+        return
 
-        response_lines = [
-            "Daily Sync Complete! (BULK OPERATIONS)",
-            "",
-            f"Date range: {start_date} to {end_date}",
-            f"Filter: updated_at (not created_at)",
-            f"Total time: {total_time:.2f}s",
-            "",
-            "Records synced:",
-            f"- Orders: {total_stats[TABLE_ORDERS]['total']}",
-            f"- Line Items: {total_stats[TABLE_ITEMS]['total']}",
-            f"- Shipping Lines: {total_stats[TABLE_SHIPPING_LINES]['total']}",
-            f"- Transactions: {total_stats[TABLE_TRANSACTIONS]['total']}",
-            f"- Refunds: {total_stats[TABLE_REFUNDS]['total']}",
-            f"- Refund Line Items: {total_stats[TABLE_REFUND_LINE_ITEMS]['total']}",
-            f"- Order Adjustments: {total_stats[TABLE_ORDER_ADJUSTMENTS]['total']}",
-        ]
-
-        response = "\n".join(response_lines)
-        logger.info(response)
-
-        return response, 200
-
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        return f"Script Error: {str(e)}", 500
+    summary_lines = [
+        "Daily Sync Complete! (BULK OPERATIONS)",
+        f"Date range: {start_date} to {end_date}",
+        f"Total time: {total_time:.2f}s",
+        f"Orders: {total_stats[TABLE_ORDERS]['total']}",
+        f"Line Items: {total_stats[TABLE_ITEMS]['total']}",
+        f"Shipping Lines: {total_stats[TABLE_SHIPPING_LINES]['total']}",
+        f"Transactions: {total_stats[TABLE_TRANSACTIONS]['total']}",
+        f"Refunds: {total_stats[TABLE_REFUNDS]['total']}",
+        f"Refund Line Items: {total_stats[TABLE_REFUND_LINE_ITEMS]['total']}",
+        f"Order Adjustments: {total_stats[TABLE_ORDER_ADJUSTMENTS]['total']}",
+    ]
+    logger.info("\n".join(summary_lines))
 
 
 # ============================================
@@ -1556,31 +1543,38 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Backfill Shopify orders to BigQuery (Bulk Operations)",
+        description="Shopify → BigQuery sync (Bulk Operations). No args = daily sync (Cloud Run Job entrypoint).",
         epilog=(
             "Examples:\n"
+            "  # Daily sync (2-day rolling window) — what Cloud Run Job runs:\n"
+            "  python main.py\n\n"
             "  # Backfill all of 2024 month-by-month:\n"
-            "  python orders_sync_bulk.py --year 2024 --chunk month\n\n"
+            "  python main.py --year 2024 --chunk month\n\n"
             "  # Backfill a specific range week-by-week:\n"
-            "  python orders_sync_bulk.py --start 2024-03-01 --end 2024-04-01 --chunk week\n\n"
+            "  python main.py --start 2024-03-01 --end 2024-04-01 --chunk week\n\n"
             "  # Backfill a specific range day-by-day (default):\n"
-            "  python orders_sync_bulk.py --start 2024-03-01 --end 2024-04-01\n\n"
+            "  python main.py --start 2024-03-01 --end 2024-04-01\n\n"
             "  # Run multiple years in parallel:\n"
-            "  python orders_sync_bulk.py --year 2022 --chunk month &\n"
-            "  python orders_sync_bulk.py --year 2023 --chunk month &\n"
-            "  python orders_sync_bulk.py --year 2024 --chunk month &\n"
+            "  python main.py --year 2022 --chunk month &\n"
+            "  python main.py --year 2023 --chunk month &\n"
+            "  python main.py --year 2024 --chunk month &\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--start", help="Start date inclusive (YYYY-MM-DD), defaults to yesterday UTC")
-    parser.add_argument("--end", help="End date exclusive (YYYY-MM-DD), defaults to today UTC")
+    parser.add_argument("--start", help="Start date inclusive (YYYY-MM-DD)")
+    parser.add_argument("--end", help="End date exclusive (YYYY-MM-DD)")
     parser.add_argument("--year", type=int, help="Backfill an entire year (sets --start to Jan 1 and --end to Jan 1 of next year)")
     parser.add_argument("--chunk", choices=["day", "week", "month"], default="day", help="Chunk size for processing (default: day)")
     args = parser.parse_args()
 
+    # No args → daily sync (Cloud Run Job entrypoint)
+    if not args.start and not args.end and not args.year:
+        run_daily_sync()
+        sys.exit(0)
+
     if args.year and (args.start or args.end):
         print("Error: --year cannot be combined with --start/--end")
-        exit(1)
+        sys.exit(1)
 
     today = datetime.now(timezone.utc).date()
 
@@ -1595,7 +1589,7 @@ if __name__ == "__main__":
 
     if start >= end:
         print(f"Error: start ({start}) must be before end ({end})")
-        exit(1)
+        sys.exit(1)
 
     token = get_shopify_token()
     client = get_bq_client()
