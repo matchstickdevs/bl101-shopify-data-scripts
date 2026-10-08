@@ -8,11 +8,21 @@
  * Cloud Run Usage:
  *   Deployed as Cloud Run function, triggered daily via Cloud Scheduler.
  *   HTTP GET/POST request triggers sync of yesterday's updated products.
+ *   Trigger with ?mode=refresh-inventory (query string or JSON body) to instead
+ *   refresh the ENTIRE catalog — catches inventory restocks that don't bump
+ *   product.updated_at and so are missed by the incremental sync.
+ *   Refresh mode also writes a per-location inventory snapshot for today
+ *   (InventoryLevelSnapshots) and refreshes Locations — see
+ *   shopify_inventory_schema.sql.
  *
  * CLI Usage:
  *   # Incremental sync (daily updates)
  *   node index.js                        # Sync products updated since yesterday
  *   node index.js --start 2025-01-15     # Sync products updated since specific date
+ *
+ *   # Full inventory refresh (entire catalog — catches restocks that don't
+ *   # bump product.updated_at and so are missed by the incremental sync)
+ *   node index.js --refresh-inventory
  *
  *   # Historical backfill
  *   node index.js --init                 # Initialize checkpoints for full backfill
@@ -44,6 +54,8 @@ const DATASET_ID = 'shopify';
 const TABLE_PRODUCTS = 'Products';
 const TABLE_VARIANTS = 'ProductVariants';
 const TABLE_SYNC_CHECKPOINTS = 'ProductSyncCheckpoints';
+const TABLE_LOCATIONS = 'Locations';
+const TABLE_INVENTORY_SNAPSHOTS = 'InventoryLevelSnapshots';
 
 const SHOP_NAME = 'bl101';
 const GRAPHQL_URL = `https://${SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json`;
@@ -54,6 +66,11 @@ const BACKFILL_CHUNK_DAYS = 90;
 const THROTTLE_DELAY_MS = 200;
 const PAGE_SIZE = 100;
 const BATCH_SIZE = 500;
+
+// Per-location inventory snapshot settings
+const INVENTORY_PAGE_SIZE = 250;
+const INVENTORY_QUANTITY_NAMES = ['available', 'on_hand', 'committed', 'incoming'];
+const MAX_THROTTLE_RETRIES = 6;
 
 // Shopify OAuth settings (for CLI mode)
 const SHOPIFY_CLIENT_ID = '5c23ff36589a5c4ec853e23b60ca305c';
@@ -129,6 +146,59 @@ query GetProducts($cursor: String, $query: String) {
                 }
               }
             }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+const LOCATIONS_QUERY = `
+query GetLocations($cursor: String) {
+  locations(first: 100, after: $cursor, includeInactive: true) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    edges {
+      node {
+        id
+        name
+        isActive
+        fulfillsOnlineOrders
+        createdAt
+        updatedAt
+        address {
+          address1
+          city
+          provinceCode
+          countryCode
+          zip
+        }
+      }
+    }
+  }
+}
+`;
+
+const INVENTORY_LEVELS_QUERY = `
+query GetInventoryLevels($locationId: ID!, $cursor: String) {
+  location(id: $locationId) {
+    inventoryLevels(first: ${INVENTORY_PAGE_SIZE}, after: $cursor) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        node {
+          updatedAt
+          item {
+            id
+          }
+          quantities(names: ${JSON.stringify(INVENTORY_QUANTITY_NAMES)}) {
+            name
+            quantity
           }
         }
       }
@@ -287,6 +357,12 @@ function getTodayDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function getTomorrowDate() {
+  const tomorrow = new Date();
+  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+  return tomorrow.toISOString().slice(0, 10);
+}
+
 function getGramMultiplier(weightUnit) {
   switch ((weightUnit || '').toUpperCase()) {
     case 'GRAMS': return 1;
@@ -340,8 +416,8 @@ function mapVariantToSchema(variant, productId) {
     price: parseFloat(variant.price) || 0,
     position: variant.position || 0,
     sku: variant.sku,
-    inventory_quantity: variant.inventoryQuantity || 0,
-    old_inventory_quantity: variant.inventoryQuantity || 0,
+    inventory_quantity: variant.inventoryQuantity ?? 0,
+    old_inventory_quantity: variant.inventoryQuantity ?? 0,
     inventory_policy: (variant.inventoryPolicy || '').toLowerCase(),
     compare_at_price: variant.compareAtPrice ? parseFloat(variant.compareAtPrice) : null,
     option1: option1,
@@ -361,6 +437,51 @@ function mapVariantToSchema(variant, productId) {
     inventory_item_id: extractLegacyId(variant.inventoryItem?.id),
     tax_code: null,
     image_id: null
+  };
+}
+
+function mapLocationToSchema(location, syncedAt) {
+  return {
+    id: extractLegacyId(location.id),
+    name: location.name,
+    is_active: location.isActive,
+    fulfills_online_orders: location.fulfillsOnlineOrders,
+    address1: location.address?.address1 || null,
+    city: location.address?.city || null,
+    province_code: location.address?.provinceCode || null,
+    country_code: location.address?.countryCode || null,
+    zip: location.address?.zip || null,
+    created_at: parseTimestamp(location.createdAt),
+    updated_at: parseTimestamp(location.updatedAt),
+    admin_graphql_api_id: location.id,
+    synced_at: syncedAt
+  };
+}
+
+/**
+ * variantLookup maps inventory_item_id -> { variant_id, product_id, sku },
+ * built from the catalog fetch in the same run.
+ */
+function mapInventoryLevelToSchema(level, locationId, snapshotDate, snapshotAt, variantLookup) {
+  const inventoryItemId = extractLegacyId(level.item?.id);
+  const variant = variantLookup.get(inventoryItemId);
+  const quantities = Object.fromEntries(
+    (level.quantities || []).map(q => [q.name, q.quantity])
+  );
+
+  return {
+    snapshot_date: snapshotDate,
+    snapshot_at: snapshotAt,
+    inventory_item_id: inventoryItemId,
+    location_id: locationId,
+    variant_id: variant?.variant_id ?? null,
+    product_id: variant?.product_id ?? null,
+    sku: variant?.sku ?? null,
+    available: quantities.available ?? null,
+    on_hand: quantities.on_hand ?? null,
+    committed: quantities.committed ?? null,
+    incoming: quantities.incoming ?? null,
+    level_updated_at: parseTimestamp(level.updatedAt)
   };
 }
 
@@ -387,8 +508,23 @@ const TABLE_CONFIG = {
       'admin_graphql_api_id', 'weight', 'weight_unit', 'inventory_item_id',
       'tax_code', 'image_id'
     ]
+  },
+  [TABLE_LOCATIONS]: {
+    merge_key: 'id',
+    columns: [
+      'id', 'name', 'is_active', 'fulfills_online_orders', 'address1', 'city',
+      'province_code', 'country_code', 'zip', 'created_at', 'updated_at',
+      'admin_graphql_api_id', 'synced_at'
+    ]
   }
 };
+
+// InventoryLevelSnapshots is append-only (replace today's partition), not MERGEd
+const INVENTORY_SNAPSHOT_COLUMNS = [
+  'snapshot_date', 'snapshot_at', 'inventory_item_id', 'location_id', 'variant_id',
+  'product_id', 'sku', 'available', 'on_hand', 'committed', 'incoming',
+  'level_updated_at'
+];
 
 // ============================================
 // STAGING TABLE OPERATIONS
@@ -434,6 +570,10 @@ async function loadToStaging(tableName, rows) {
       } catch (e) {
         if (e.name === 'PartialFailureError') {
           totalPartialFailures += e.errors?.length || 0;
+          const sample = e.errors?.[0];
+          if (sample) {
+            logger.warn(`  Sample failure in ${tableName}: row=${JSON.stringify(sample.row)} errors=${JSON.stringify(sample.errors)}`);
+          }
         } else {
           return { tableName, success: false, error: e.message };
         }
@@ -630,6 +770,64 @@ async function executeBulkMerge(accumulator) {
   return { success: true, error: null };
 }
 
+/**
+ * Write one day's inventory snapshot + the Locations reference table.
+ * Replaces any existing rows for snapshotDate, so same-day re-runs don't
+ * duplicate. Fails on partial insert failures: an incomplete snapshot would
+ * silently skew sell-through math.
+ */
+async function executeInventorySnapshot(locationRows, snapshotRows, snapshotDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshotDate)) {
+    throw new Error(`Invalid snapshot date: ${snapshotDate}`);
+  }
+
+  const tables = [TABLE_LOCATIONS, TABLE_INVENTORY_SNAPSHOTS];
+
+  logger.info('Loading inventory data to staging tables...');
+  for (const [tableName, rows] of [[TABLE_LOCATIONS, locationRows], [TABLE_INVENTORY_SNAPSHOTS, snapshotRows]]) {
+    const result = await loadToStaging(tableName, rows);
+    if (!result.success) {
+      return { success: false, error: `Failed to load ${tableName} to staging: ${result.error}` };
+    }
+    if (result.partialFailures) {
+      return { success: false, error: `${result.partialFailures} rows failed to load into ${tableName}_staging` };
+    }
+  }
+
+  const snapshotTable = `\`${GCP_PROJECT}.${DATASET_ID}.${TABLE_INVENTORY_SNAPSHOTS}\``;
+  const snapshotStaging = `\`${GCP_PROJECT}.${DATASET_ID}.${TABLE_INVENTORY_SNAPSHOTS}_staging\``;
+  const cols = INVENTORY_SNAPSHOT_COLUMNS.join(', ');
+
+  const statements = [];
+  if (locationRows.length > 0) {
+    statements.push(buildMergeStatement(TABLE_LOCATIONS));
+  }
+  if (snapshotRows.length > 0) {
+    statements.push(`DELETE FROM ${snapshotTable} WHERE snapshot_date = DATE '${snapshotDate}';`);
+    statements.push(`INSERT INTO ${snapshotTable} (${cols}) SELECT ${cols} FROM ${snapshotStaging};`);
+  }
+
+  if (statements.length > 0) {
+    logger.info(`Writing inventory snapshot for ${snapshotDate}...`);
+    try {
+      await bigquery.query(`BEGIN TRANSACTION;\n${statements.join('\n')}\nCOMMIT TRANSACTION;`);
+    } catch (e) {
+      return { success: false, error: `Inventory snapshot transaction failed: ${e.message}` };
+    }
+  }
+
+  for (const tableName of tables) {
+    const stagingTable = `${GCP_PROJECT}.${DATASET_ID}.${tableName}_staging`;
+    try {
+      await bigquery.query(`TRUNCATE TABLE \`${stagingTable}\``);
+    } catch (e) {
+      logger.warn(`Failed to truncate ${stagingTable}: ${e.message}`);
+    }
+  }
+
+  return { success: true, error: null };
+}
+
 // ============================================
 // GRAPHQL EXECUTION
 // ============================================
@@ -641,27 +839,49 @@ async function executeGraphQL(accessToken, query, variables, debug = false) {
     logger.info('Variables:', JSON.stringify(variables, null, 2));
   }
 
-  const response = await fetch(GRAPHQL_URL, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': accessToken,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ query, variables })
-  });
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(GRAPHQL_URL, {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': accessToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ query, variables })
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    return { data: null, error: `HTTP ${response.status}: ${errorText}` };
+    const throttledHttp = response.status === 429;
+    if (!response.ok && !throttledHttp) {
+      const errorText = await response.text();
+      return { data: null, error: `HTTP ${response.status}: ${errorText}` };
+    }
+
+    const result = throttledHttp ? {} : await response.json();
+    const throttled = throttledHttp ||
+      (result.errors || []).some(e => e.extensions?.code === 'THROTTLED');
+
+    if (throttled && attempt < MAX_THROTTLE_RETRIES) {
+      // Wait long enough for the cost bucket to refill for this query
+      const cost = result.extensions?.cost;
+      const status = cost?.throttleStatus;
+      const needed = (cost?.requestedQueryCost || 0) - (status?.currentlyAvailable || 0);
+      const waitMs = status?.restoreRate && needed > 0
+        ? Math.ceil((needed / status.restoreRate) * 1000) + 250
+        : 2000 * (attempt + 1);
+      logger.warn(`  Shopify throttled, retrying in ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${MAX_THROTTLE_RETRIES})`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      continue;
+    }
+
+    if (throttledHttp) {
+      return { data: null, error: 'HTTP 429: throttled (retries exhausted)' };
+    }
+
+    if (result.errors) {
+      return { data: null, error: `GraphQL Errors: ${JSON.stringify(result.errors)}` };
+    }
+
+    return { data: result.data, error: null };
   }
-
-  const result = await response.json();
-
-  if (result.errors) {
-    return { data: null, error: `GraphQL Errors: ${JSON.stringify(result.errors)}` };
-  }
-
-  return { data: result.data, error: null };
 }
 
 // ============================================
@@ -671,8 +891,13 @@ async function executeGraphQL(accessToken, query, variables, debug = false) {
 async function fetchAllProducts(accessToken, startDate, endDate, useOAuth = false) {
   const accumulator = new ProductDataAccumulator();
 
-  const queryFilter = `updated_at:>='${startDate}' AND updated_at:<'${endDate}'`;
-  logger.info(`Query filter: ${queryFilter}`);
+  // When both dates are provided, fetch only products updated in the window.
+  // When they're omitted (full inventory refresh), pass no filter so Shopify
+  // returns the entire catalog.
+  const queryFilter = (startDate && endDate)
+    ? `updated_at:>='${startDate}' AND updated_at:<'${endDate}'`
+    : null;
+  logger.info(`Query filter: ${queryFilter || '(none — full catalog)'}`);
 
   let cursor = null;
   let hasNextPage = true;
@@ -725,7 +950,119 @@ async function fetchAllProducts(accessToken, startDate, endDate, useOAuth = fals
   return { accumulator, error: null };
 }
 
-async function syncProductsForDateRange(accessToken, startDate, endDate, useOAuth = false) {
+async function fetchLocations(accessToken) {
+  const locations = [];
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const { data, error } = await executeGraphQL(accessToken, LOCATIONS_QUERY, { cursor });
+    if (error) {
+      return { locations: null, error: `Shopify API Error (locations): ${error}` };
+    }
+
+    const conn = data?.locations || {};
+    for (const edge of conn.edges || []) {
+      locations.push(edge.node);
+    }
+
+    hasNextPage = conn.pageInfo?.hasNextPage || false;
+    cursor = conn.pageInfo?.endCursor;
+  }
+
+  return { locations, error: null };
+}
+
+async function fetchInventoryLevels(accessToken, location, snapshotDate, snapshotAt, variantLookup) {
+  const locationId = extractLegacyId(location.id);
+  const rows = [];
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const { data, error } = await executeGraphQL(
+      accessToken, INVENTORY_LEVELS_QUERY, { locationId: location.id, cursor }
+    );
+    if (error) {
+      return { rows: null, error: `Shopify API Error (inventory levels @ ${location.name}): ${error}` };
+    }
+
+    const conn = data?.location?.inventoryLevels || {};
+    for (const edge of conn.edges || []) {
+      rows.push(mapInventoryLevelToSchema(edge.node, locationId, snapshotDate, snapshotAt, variantLookup));
+    }
+
+    hasNextPage = conn.pageInfo?.hasNextPage || false;
+    cursor = conn.pageInfo?.endCursor;
+
+    if (hasNextPage) {
+      await new Promise(resolve => setTimeout(resolve, THROTTLE_DELAY_MS));
+    }
+  }
+
+  return { rows, error: null };
+}
+
+/**
+ * Snapshot per-location inventory for every ACTIVE location and write it to
+ * InventoryLevelSnapshots (today's UTC partition) + refresh Locations.
+ *
+ * Expects the full-catalog variants from the same run so each inventory item
+ * can be tagged with its variant/product/SKU without extra API cost.
+ */
+async function syncInventorySnapshot(accessToken, catalogVariants) {
+  const snapshotDate = getTodayDate();
+  const snapshotAt = new Date().toISOString();
+
+  const variantLookup = new Map();
+  for (const v of catalogVariants) {
+    if (v.inventory_item_id) {
+      variantLookup.set(v.inventory_item_id, {
+        variant_id: v.id, product_id: v.product_id, sku: v.sku
+      });
+    }
+  }
+
+  const { locations, error: locError } = await fetchLocations(accessToken);
+  if (locError) {
+    return { success: false, error: locError, stats: null };
+  }
+
+  const activeLocations = locations.filter(l => l.isActive);
+  logger.info(`Found ${locations.length} locations (${activeLocations.length} active): ${activeLocations.map(l => l.name).join(', ')}`);
+
+  const snapshotRows = [];
+  for (const location of activeLocations) {
+    const { rows, error } = await fetchInventoryLevels(
+      accessToken, location, snapshotDate, snapshotAt, variantLookup
+    );
+    if (error) {
+      return { success: false, error, stats: null };
+    }
+    const unmatched = rows.filter(r => !r.variant_id).length;
+    logger.info(`  ${location.name}: ${rows.length} inventory levels${unmatched ? ` (${unmatched} not matched to a catalog variant)` : ''}`);
+    snapshotRows.push(...rows);
+  }
+
+  const locationRows = locations.map(l => mapLocationToSchema(l, snapshotAt));
+  const { success, error } = await executeInventorySnapshot(locationRows, snapshotRows, snapshotDate);
+
+  return {
+    success,
+    error,
+    stats: {
+      [TABLE_LOCATIONS]: { total: locationRows.length, active: activeLocations.length },
+      [TABLE_INVENTORY_SNAPSHOTS]: { total: snapshotRows.length, snapshotDate }
+    }
+  };
+}
+
+/**
+ * options.snapshotInventory: after the product MERGE, also snapshot
+ * per-location inventory. Only meaningful for a full-catalog fetch (null
+ * dates), since the variant lookup comes from the fetched products.
+ */
+async function syncProductsForDateRange(accessToken, startDate, endDate, useOAuth = false, options = {}) {
   // Step 1: Fetch all products
   logger.info('Step 1: Fetching all products from Shopify...');
   const { accumulator, error } = await fetchAllProducts(accessToken, startDate, endDate, useOAuth);
@@ -754,6 +1091,18 @@ async function syncProductsForDateRange(accessToken, startDate, endDate, useOAut
   const mergeTotalTime = (Date.now() - mergeStart) / 1000;
   logger.info(`BigQuery operations complete in ${mergeTotalTime.toFixed(2)}s`);
 
+  // Step 3 (optional): per-location inventory snapshot
+  if (options.snapshotInventory) {
+    logger.info('Step 3: Snapshotting per-location inventory...');
+    const snapStart = Date.now();
+    const snap = await syncInventorySnapshot(accessToken, accumulator.variants);
+    if (!snap.success) {
+      return { success: false, error: snap.error, stats: totalStats };
+    }
+    Object.assign(totalStats, snap.stats);
+    logger.info(`Inventory snapshot complete in ${((Date.now() - snapStart) / 1000).toFixed(2)}s`);
+  }
+
   return { success: true, error: null, stats: totalStats };
 }
 
@@ -769,20 +1118,29 @@ functions.http('main', async (req, res) => {
     logger.info('SHOPIFY DAILY PRODUCT SYNC (CLOUD RUN)');
     logger.info('='.repeat(60));
 
-    // Calculate yesterday's date range (UTC)
-    const today = getTodayDate();
-    const yesterday = getYesterdayDate();
-    const startDate = yesterday;
-    const endDate = today;
+    // Default: incremental sync (yesterday -> today). When triggered with
+    // ?mode=refresh-inventory (or {"mode":"refresh-inventory"} in the body),
+    // do a full-catalog refresh instead: null dates => no updated_at filter, so
+    // it also catches inventory restocks that don't bump product.updated_at.
+    const refreshInventory =
+      req.query?.mode === 'refresh-inventory' || req.body?.mode === 'refresh-inventory';
 
-    logger.info(`Syncing products updated: ${startDate} to ${endDate}`);
+    const startDate = refreshInventory ? null : getYesterdayDate();
+    const endDate = refreshInventory ? null : getTodayDate();
+    const rangeLabel = refreshInventory
+      ? 'FULL CATALOG (inventory refresh)'
+      : `${startDate} to ${endDate}`;
+
+    logger.info(refreshInventory
+      ? 'Refreshing inventory for ALL products (full catalog, no updated_at filter)'
+      : `Syncing products updated: ${startDate} to ${endDate}`);
 
     // Get Shopify token (from Secret Manager for Cloud Run)
     const { accessToken } = await getShopifyToken(false);
 
     // Run sync
     const { success, error, stats } = await syncProductsForDateRange(
-      accessToken, startDate, endDate, false
+      accessToken, startDate, endDate, false, { snapshotInventory: refreshInventory }
     );
 
     const totalTime = (Date.now() - startTime) / 1000;
@@ -795,10 +1153,10 @@ functions.http('main', async (req, res) => {
 
     // Format response
     if (!stats || stats[TABLE_PRODUCTS].total === 0) {
-      logger.info('No products found for the date range.');
+      logger.info('No products found.');
       res.status(200).send(
         `Daily Product Sync Complete!\n\n` +
-        `Date range: ${startDate} to ${endDate}\n` +
+        `Scope: ${rangeLabel}\n` +
         `No products found.\n` +
         `Total time: ${totalTime.toFixed(2)}s`
       );
@@ -806,16 +1164,22 @@ functions.http('main', async (req, res) => {
     }
 
     const responseLines = [
-      'Daily Product Sync Complete!',
+      refreshInventory ? 'Inventory Refresh Complete!' : 'Daily Product Sync Complete!',
       '',
-      `Date range: ${startDate} to ${endDate}`,
-      `Filter: updated_at`,
+      `Scope: ${rangeLabel}`,
       `Total time: ${totalTime.toFixed(2)}s`,
       '',
       'Records synced:',
       `- Products: ${stats[TABLE_PRODUCTS].total}`,
       `- Variants: ${stats[TABLE_VARIANTS].total}`
     ];
+
+    if (stats[TABLE_INVENTORY_SNAPSHOTS]) {
+      responseLines.push(
+        `- Locations: ${stats[TABLE_LOCATIONS].total} (${stats[TABLE_LOCATIONS].active} active)`,
+        `- Inventory snapshot rows (${stats[TABLE_INVENTORY_SNAPSHOTS].snapshotDate}): ${stats[TABLE_INVENTORY_SNAPSHOTS].total}`
+      );
+    }
 
     const response = responseLines.join('\n');
     logger.info(response);
@@ -990,7 +1354,7 @@ async function getBackfillProgress() {
 
 async function cmdIncrementalSync(args) {
   const startDate = args.startDate || getYesterdayDate();
-  const endDate = args.endDate || getTodayDate();
+  const endDate = args.endDate || getTomorrowDate();
 
   logger.info('Starting incremental product sync...');
   logger.info(`  Fetching products updated from ${startDate} to ${endDate}`);
@@ -1021,6 +1385,54 @@ async function cmdIncrementalSync(args) {
   console.log(`  Date range: ${startDate} to ${endDate}`);
   console.log(`  Products synced: ${productsCount.toLocaleString()}`);
   console.log(`  Variants synced: ${stats?.[TABLE_VARIANTS]?.total || 0}`);
+  console.log(`  Duration: ${totalTime.toFixed(1)} seconds`);
+  console.log('='.repeat(50) + '\n');
+}
+
+/**
+ * Full inventory refresh: re-fetch the ENTIRE catalog (no updated_at filter)
+ * and MERGE it into BigQuery.
+ *
+ * The daily incremental sync keys off product.updated_at, but Shopify inventory
+ * adjustments (e.g. restocking a sold-out variant) don't reliably bump
+ * updated_at, so restocked products are never re-fetched and BigQuery keeps the
+ * stale quantity. This command sidesteps that by refreshing every product, which
+ * also self-heals any other drift since it's a full upsert of the same columns.
+ * It then snapshots per-location inventory into InventoryLevelSnapshots.
+ */
+async function cmdRefreshInventory() {
+  logger.info('Starting full inventory refresh (entire catalog)...');
+  logger.info('  Fetching ALL products (no updated_at filter)');
+  logger.info('  Using MERGE upsert pattern (full product + variant upsert)');
+  logger.info('');
+
+  const startTime = Date.now();
+
+  // Get token via OAuth (works for both CLI and Cloud Run Job execution)
+  const { accessToken } = await getShopifyToken(true);
+
+  // null date range => full-catalog fetch in fetchAllProducts
+  const { success, error, stats } = await syncProductsForDateRange(
+    accessToken, null, null, true, { snapshotInventory: true }
+  );
+
+  const totalTime = (Date.now() - startTime) / 1000;
+
+  if (!success) {
+    throw new Error(error);
+  }
+
+  const productsCount = stats?.[TABLE_PRODUCTS]?.total || 0;
+
+  console.log('\n' + '='.repeat(50));
+  console.log('INVENTORY REFRESH COMPLETE');
+  console.log('='.repeat(50));
+  console.log(`  Products refreshed: ${productsCount.toLocaleString()}`);
+  console.log(`  Variants refreshed: ${(stats?.[TABLE_VARIANTS]?.total || 0).toLocaleString()}`);
+  if (stats?.[TABLE_INVENTORY_SNAPSHOTS]) {
+    console.log(`  Locations: ${stats[TABLE_LOCATIONS].total} (${stats[TABLE_LOCATIONS].active} active)`);
+    console.log(`  Inventory snapshot rows (${stats[TABLE_INVENTORY_SNAPSHOTS].snapshotDate}): ${stats[TABLE_INVENTORY_SNAPSHOTS].total.toLocaleString()}`);
+  }
   console.log(`  Duration: ${totalTime.toFixed(1)} seconds`);
   console.log('='.repeat(50) + '\n');
 }
@@ -1211,6 +1623,7 @@ async function runCLI() {
     status: process.argv.includes('--status'),
     retryFailed: process.argv.includes('--retry-failed'),
     backfill: process.argv.includes('--backfill'),
+    refreshInventory: process.argv.includes('--refresh-inventory'),
     continueOnError: process.argv.includes('--continue-on-error'),
     startDate: null,
     endDate: null,
@@ -1247,6 +1660,8 @@ async function runCLI() {
       await cmdRetryFailed();
     } else if (args.backfill) {
       await cmdBackfill(args);
+    } else if (args.refreshInventory) {
+      await cmdRefreshInventory();
     } else {
       // Default: incremental sync
       await cmdIncrementalSync(args);

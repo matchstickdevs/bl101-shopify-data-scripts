@@ -19,7 +19,8 @@ Architecture:
 
 Usage:
     Deployed as a Cloud Run Job, triggered daily via Cloud Scheduler.
-    Run with no arguments for the daily sync (2-day rolling window).
+    Run with no arguments for the daily sync (7-day rolling window,
+    processed one day at a time to bound memory).
     Run with --start/--end or --year for backfills.
 
 GCP Secrets Required:
@@ -35,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import secretmanager
 from google.cloud import bigquery
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, parse_qs
 import time
 import io
 
@@ -73,6 +75,12 @@ POLL_MAX_INTERVAL_SECONDS = 30  # Cap on poll interval
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
 
+# HTTP timeouts (connect, read) in seconds. Without an explicit timeout,
+# requests waits forever on a stalled connection — the whole job then hangs
+# silently until Cloud Run kills it at the task timeout.
+HTTP_TIMEOUT = (10, 180)
+DOWNLOAD_TIMEOUT = (10, 300)
+
 # ============================================
 # TABLE SCHEMAS - Define merge keys and columns
 # ============================================
@@ -80,6 +88,14 @@ RETRY_DELAY_SECONDS = 2
 TABLE_CONFIG = {
     TABLE_ORDERS: {
         "merge_key": "id",
+        # Attribution fields populate asynchronously in Shopify (customerJourneySummary
+        # can come back null on early fetches). COALESCE on MERGE so a later null
+        # fetch never wipes a previously-good value.
+        "preserve_on_null": {
+            "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+            "source_identifier", "source_url", "landing_site", "landing_site_ref",
+            "referring_site",
+        },
         "columns": [
             "id", "admin_graphql_api_id", "app_id", "token", "checkout_token",
             "order_number", "number", "name", "confirmation_number", "customer_id",
@@ -370,7 +386,8 @@ def get_shopify_token():
             "grant_type": "client_credentials",
             "client_id": client_id,
             "client_secret": client_secret,
-        }
+        },
+        timeout=HTTP_TIMEOUT,
     )
     response.raise_for_status()
     token = response.json()["access_token"]
@@ -430,6 +447,28 @@ def extract_legacy_id(gid):
     return str(gid)
 
 
+def parse_utm_from_url(url):
+    """Pull utm_* query params out of a landing page URL.
+
+    Fallback for orders that don't have a customerJourneySummary populated but
+    still carry attribution in the landing_site query string (common for older
+    orders and certain checkout flows).
+    """
+    if not url:
+        return {}
+    try:
+        qs = parse_qs(urlparse(url).query)
+        return {
+            "source": qs.get("utm_source", [None])[0],
+            "medium": qs.get("utm_medium", [None])[0],
+            "campaign": qs.get("utm_campaign", [None])[0],
+            "content": qs.get("utm_content", [None])[0],
+            "term": qs.get("utm_term", [None])[0],
+        }
+    except (ValueError, TypeError):
+        return {}
+
+
 # ============================================
 # GRAPHQL EXECUTION
 # ============================================
@@ -449,7 +488,7 @@ def execute_graphql(token, query, variables=None):
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.post(GRAPHQL_URL, headers=headers, json=payload)
+            response = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
 
             if response.status_code == 429:
                 try:
@@ -466,8 +505,9 @@ def execute_graphql(token, query, variables=None):
             if "errors" in data:
                 errors = data["errors"]
                 if any("THROTTLED" in str(e) for e in errors):
-                    logger.warning(f"GraphQL throttled, waiting {RETRY_DELAY_SECONDS}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                    time.sleep(RETRY_DELAY_SECONDS)
+                    wait = RETRY_DELAY_SECONDS * (2 ** attempt)
+                    logger.warning(f"GraphQL throttled, waiting {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(wait)
                     continue
                 return None, f"GraphQL Errors: {json.dumps(errors)}"
 
@@ -589,24 +629,19 @@ def poll_bulk_operation(token, operation_id):
 
 def download_jsonl(url):
     """
-    Download and parse a JSONL file from Shopify's bulk operation result URL.
-    Streams line by line to avoid loading entire file into memory.
-    Returns list of parsed JSON objects.
+    Download a JSONL file from Shopify's bulk operation result URL and yield
+    parsed objects one at a time so the raw response is never fully loaded into
+    memory alongside the already-mapped accumulator data.
     """
-    logger.info(f"Downloading JSONL results...")
-    response = requests.get(url, stream=True)
+    logger.info("Downloading JSONL results...")
+    response = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
     response.raise_for_status()
-
-    objects = []
     line_count = 0
     for line in response.iter_lines():
         if line:
             line_count += 1
-            obj = json.loads(line)
-            objects.append(obj)
-
-    logger.info(f"Downloaded {line_count} JSONL lines ({len(objects)} objects)")
-    return objects
+            yield json.loads(line)
+    logger.info(f"Downloaded {line_count} JSONL lines")
 
 
 # ============================================
@@ -754,6 +789,16 @@ class OrderDataAccumulator:
         first_visit = journey.get("firstVisit") or {}
         utm_params = first_visit.get("utmParameters") or {}
 
+        # Fallback: if utmParameters is empty/null, try parsing them out of the
+        # landing page URL's query string.
+        landing_page = first_visit.get("landingPage")
+        utm_from_landing = parse_utm_from_url(landing_page) if not utm_params.get("source") else {}
+        utm_source = utm_params.get("source") or utm_from_landing.get("source")
+        utm_medium = utm_params.get("medium") or utm_from_landing.get("medium")
+        utm_campaign = utm_params.get("campaign") or utm_from_landing.get("campaign")
+        utm_content = utm_params.get("content") or utm_from_landing.get("content")
+        utm_term = utm_params.get("term") or utm_from_landing.get("term")
+
         return {
             "id": extract_legacy_id(order.get("id")),
             "admin_graphql_api_id": order.get("id"),
@@ -799,8 +844,8 @@ class OrderDataAccumulator:
             "source_name": order.get("sourceName"),
             "source_identifier": first_visit.get("source"),
             "source_url": first_visit.get("referrerUrl"),
-            "landing_site": first_visit.get("landingPage"),
-            "landing_site_ref": utm_params.get("source"),
+            "landing_site": landing_page,
+            "landing_site_ref": utm_source,
             "referring_site": first_visit.get("referrerUrl"),
             "location_id": None,
             "shipping_address_id": None,
@@ -823,11 +868,11 @@ class OrderDataAccumulator:
             "discount_codes": to_json_str(order.get("discountCodes")),
             "discount_applications": None,  # Patched in after processing all children
             "exchange": "-EXC" in name,
-            "utm_source": utm_params.get("source"),
-            "utm_medium": utm_params.get("medium"),
-            "utm_campaign": utm_params.get("campaign"),
-            "utm_content": utm_params.get("content"),
-            "utm_term": utm_params.get("term"),
+            "utm_source": utm_source,
+            "utm_medium": utm_medium,
+            "utm_campaign": utm_campaign,
+            "utm_content": utm_content,
+            "utm_term": utm_term,
         }
 
     def _map_line_item_from_bulk(self, item, parent_order_id):
@@ -997,11 +1042,15 @@ class OrderDataAccumulator:
         }
 
     def get_stats(self):
-        """Return counts for all accumulated data (after deduplication)."""
-        deduplicated = self.get_all_data()
+        """Return counts for all accumulated data."""
         return {
-            table: {"total": len(data)}
-            for table, data in deduplicated.items()
+            TABLE_ORDERS: {"total": len(self.orders)},
+            TABLE_ITEMS: {"total": len(self.line_items)},
+            TABLE_SHIPPING_LINES: {"total": len(self.shipping_lines)},
+            TABLE_TRANSACTIONS: {"total": len(self.transactions)},
+            TABLE_REFUNDS: {"total": len(self.refunds)},
+            TABLE_REFUND_LINE_ITEMS: {"total": len(self.refund_line_items)},
+            TABLE_ORDER_ADJUSTMENTS: {"total": len(self.order_adjustments)},
         }
 
 
@@ -1056,11 +1105,20 @@ def build_merge_statement(table_name, staging_suffix=""):
     config = TABLE_CONFIG[table_name]
     merge_key = config["merge_key"]
     columns = config["columns"]
+    preserve_on_null = config.get("preserve_on_null", set())
 
     target_table = f"`{GCP_PROJECT}.{DATASET_ID}.{table_name}`"
     staging_table = f"`{GCP_PROJECT}.{DATASET_ID}.{table_name}_staging{staging_suffix}`"
 
-    update_cols = [f"T.{col} = S.{col}" for col in columns if col != merge_key and col not in (merge_key if isinstance(merge_key, list) else [merge_key])]
+    key_cols = set(merge_key) if isinstance(merge_key, list) else {merge_key}
+    update_cols = []
+    for col in columns:
+        if col in key_cols:
+            continue
+        if col in preserve_on_null:
+            update_cols.append(f"T.{col} = COALESCE(S.{col}, T.{col})")
+        else:
+            update_cols.append(f"T.{col} = S.{col}")
     insert_cols = ", ".join(columns)
     insert_vals = ", ".join([f"S.{col}" for col in columns])
 
@@ -1175,6 +1233,8 @@ def execute_bulk_merge(client, accumulator, staging_suffix=""):
         if data:
             merge_stmt = build_merge_statement(table_name, staging_suffix)
             statements.append(merge_stmt)
+
+    del all_data  # Free mapped rows now that they're in BigQuery staging
 
     if statements:
         transaction_query = "BEGIN TRANSACTION;\n"
@@ -1297,8 +1357,11 @@ query GetRefundChildren($ids: [ID!]!) {
 }
 """
 
-# Shopify nodes() accepts up to 250 IDs per request
-REFUND_CHILDREN_BATCH_SIZE = 250
+# Shopify nodes() accepts up to 250 IDs per request, but each order here
+# expands refunds × (100 refund line items + 10 transactions + 20 adjustments),
+# so a 250-ID batch is an enormous request that Shopify can stall on or
+# reject for query cost. Keep batches small so each request stays cheap.
+REFUND_CHILDREN_BATCH_SIZE = 25
 
 
 def fetch_refund_children(token, accumulator, start_date, end_date):
@@ -1402,16 +1465,21 @@ def fetch_all_orders_bulk(token, start_date, end_date):
     # Process results into the accumulator
     parse_start = time.time()
 
-    if objects:
-        logger.info(f"Processing {len(objects)} objects from bulk query...")
+    if objects is not None:
+        logger.info("Processing JSONL objects from bulk query (streaming)...")
         accumulator.process_bulk_results(objects)
 
     parse_time = time.time() - parse_start
 
-    # Step 2: Fetch refund children via paginated queries (can't be in bulk ops)
+    # Step 2: Fetch refund children via paginated queries (can't be in bulk ops).
+    # A failure here must fail the whole chunk: merging with an empty
+    # RefundLineItems staging table would trigger the orphan-cleanup DELETE
+    # and wipe existing refund line items for every refund in the window.
     if accumulator.refunds:
         refund_start = time.time()
-        fetch_refund_children(token, accumulator, start_date, end_date)
+        error = fetch_refund_children(token, accumulator, start_date, end_date)
+        if error:
+            return None, f"Refund children fetch failed: {error}"
         refund_time = time.time() - refund_start
         logger.info(f"Refund children fetch took {refund_time:.2f}s")
 
@@ -1467,9 +1535,17 @@ def sync_orders_for_date_range(token, client, start_date, end_date, staging_suff
 
 def run_daily_sync():
     """
-    Daily sync entry point. Syncs the last 2 days of orders to BigQuery.
-    The 2-day window catches orders whose customerJourneySummary attribution
-    data populates after creation.
+    Daily sync entry point. Syncs the last 7 days of orders to BigQuery,
+    processed one day at a time so peak memory stays bounded to a single
+    day of updates. (A mass update of historical orders — bulk tag edit,
+    app/Flow rewriting old orders — bumps updated_at on all of them and can
+    balloon the window far past normal volume; syncing the whole window in
+    one pass caused container OOMs.)
+
+    The 7-day window gives Shopify's customerJourneySummary plenty of time to
+    populate attribution after the order is created; combined with the
+    COALESCE-on-null MERGE for attribution columns, repeated fetches can only
+    add UTM data, never wipe it.
     """
     start_time = time.time()
 
@@ -1478,32 +1554,46 @@ def run_daily_sync():
     logger.info("=" * 60)
 
     today = datetime.now(timezone.utc).date()
-    two_days_ago = today - timedelta(days=2)
-    start_date = two_days_ago.isoformat()
-    end_date = today.isoformat()
+    window_start = today - timedelta(days=7)
 
-    logger.info(f"Syncing orders updated: {start_date} to {end_date}")
+    logger.info(f"Syncing orders updated: {window_start} to {today} (one day at a time)")
 
     token = get_shopify_token()
     client = get_bq_client()
 
-    success, error, total_stats = sync_orders_for_date_range(
-        token, client, start_date, end_date
-    )
+    chunks = list(generate_chunks(window_start, today, chunk_size="day"))
+    total_stats = {table: {"total": 0} for table in TABLE_CONFIG}
+    failed_days = []
+
+    for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
+        logger.info(f"--- Day {i}/{len(chunks)}: {chunk_start} to {chunk_end} ---")
+
+        success, error, stats = sync_orders_for_date_range(
+            token, client, chunk_start.isoformat(), chunk_end.isoformat()
+        )
+
+        if not success:
+            logger.error(f"FAILED {chunk_start}: {error}")
+            failed_days.append((chunk_start, error))
+        elif stats:
+            for table, s in stats.items():
+                total_stats[table]["total"] += s["total"]
 
     total_time = time.time() - start_time
 
-    if not success:
-        logger.error(f"Sync failed: {error}")
+    if failed_days:
+        logger.error(f"Sync failed for {len(failed_days)} of {len(chunks)} days:")
+        for day, error in failed_days:
+            logger.error(f"  {day}: {error}")
         sys.exit(1)
 
     if total_stats[TABLE_ORDERS]["total"] == 0:
-        logger.info(f"Daily Sync Complete! No orders found for {start_date} to {end_date}. Total time: {total_time:.2f}s")
+        logger.info(f"Daily Sync Complete! No orders found for {window_start} to {today}. Total time: {total_time:.2f}s")
         return
 
     summary_lines = [
         "Daily Sync Complete! (BULK OPERATIONS)",
-        f"Date range: {start_date} to {end_date}",
+        f"Date range: {window_start} to {today} ({len(chunks)} daily chunks)",
         f"Total time: {total_time:.2f}s",
         f"Orders: {total_stats[TABLE_ORDERS]['total']}",
         f"Line Items: {total_stats[TABLE_ITEMS]['total']}",
@@ -1546,7 +1636,7 @@ if __name__ == "__main__":
         description="Shopify → BigQuery sync (Bulk Operations). No args = daily sync (Cloud Run Job entrypoint).",
         epilog=(
             "Examples:\n"
-            "  # Daily sync (2-day rolling window) — what Cloud Run Job runs:\n"
+            "  # Daily sync (7-day rolling window, day-by-day) — what Cloud Run Job runs:\n"
             "  python main.py\n\n"
             "  # Backfill all of 2024 month-by-month:\n"
             "  python main.py --year 2024 --chunk month\n\n"

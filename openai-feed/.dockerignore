@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.env
+.feed-sample
+*.jsonl.gz
+*.header.json
+.git
+.gitignore
+Dockerfile
+.dockerignore

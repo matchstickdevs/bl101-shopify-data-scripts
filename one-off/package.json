@@ -1,0 +1,13 @@
+{
+  "name": "one-off",
+  "version": "1.0.0",
+  "description": "One-off Shopify maintenance scripts",
+  "type": "commonjs",
+  "scripts": {
+    "inventory": "node product-variant-inventory.js"
+  },
+  "dependencies": {
+    "@google-cloud/secret-manager": "^6.1.2",
+    "dotenv": "^17.4.2"
+  }
+}

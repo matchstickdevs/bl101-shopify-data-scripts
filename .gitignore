@@ -1,0 +1,7 @@
+.env
+node_modules/
+
+# Local feed output (OpenAI product feed dry-runs)
+.feed-sample*/
+*.jsonl.gz
+*.header.json

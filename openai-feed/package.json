@@ -1,0 +1,17 @@
+{
+  "name": "bl101-openai-feed",
+  "version": "3.0.0",
+  "description": "BL101 → OpenAI product feed: fetches products from the Shopify Admin API, builds a flat full-catalog snapshot in OpenAI's file-upload/products schema, and pushes it to OpenAI over SFTP as bl101_products.csv. Cloud Run Job + CLI.",
+  "main": "openai-feed.js",
+  "scripts": {
+    "start": "node openai-feed.js",
+    "test": "node --test"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google-cloud/secret-manager": "^6.1.2",
+    "dotenv": "^17.4.2",
+    "ssh2-sftp-client": "^12.0.0"
+  }
+}
