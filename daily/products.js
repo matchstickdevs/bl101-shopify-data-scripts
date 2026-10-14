@@ -58,7 +58,7 @@ const TABLE_LOCATIONS = 'Locations';
 const TABLE_INVENTORY_SNAPSHOTS = 'InventoryLevelSnapshots';
 
 const SHOP_NAME = 'bl101';
-const GRAPHQL_URL = `https://${SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json`;
+const GRAPHQL_URL = `https://${SHOP_NAME}.myshopify.com/admin/api/2026-10/graphql.json`;
 
 // Backfill settings
 const BACKFILL_START_DATE = '2020-01-01';

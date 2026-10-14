@@ -42,7 +42,7 @@ const TABLE_COLLECTIONS = 'Collections';
 const TABLE_COLLECTION_PRODUCTS = 'CollectionProducts';
 
 const SHOP_NAME = 'bl101';
-const GRAPHQL_URL = `https://${SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json`;
+const GRAPHQL_URL = `https://${SHOP_NAME}.myshopify.com/admin/api/2026-10/graphql.json`;
 
 // Sync settings
 const THROTTLE_DELAY_MS = 200;
